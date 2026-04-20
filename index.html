@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>狙擊特攻：時空獵人</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #0a0a0a;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            cursor: crosshair;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+        }
+        .stat {
+            font-size: 18px;
+            margin-bottom: 5px;
+            color: #00ffcc;
+        }
+        .hint {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255,255,255,0.5);
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div class="stat">分數: <span id="score">0</span></div>
+        <div class="stat">模式: <span id="mode">一般模式</span></div>
+        <div class="stat">火力等級: <span id="power">1</span></div>
+    </div>
+
+    <div class="hint">WASD 移動 | 左鍵 射擊 | 右鍵(長按) 進入狙擊模式(慢動作)</div>
+
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 遊戲常數與配置
+ */
+const config = {
+    normalTime: 1.0,
+    slowTime: 0.15,
+    recoil: 12,
+    basePlayerSpeed: 5,
+    bulletDamage: 50,
+    shakeDecay: 0.9,
+    particleGravity: 0.2
+};
+
+/**
+ * 全域狀態
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let width, height;
+let score = 0;
+let timeScale = config.normalTime;
+let lastTime = 0;
+let shakeIntensity = 0;
+const keys = {};
+
+/**
+ * 粒子類別 - 處理爆炸與火花
+ */
+class Particle {
+    constructor(x, y, color) {
+        this.x = x;
+        this.y = y;
+        this.color = color;
+        const angle = Math.random() * Math.PI * 2;
+        const force = Math.random() * 10 + 2;
+        this.vx = Math.cos(angle) * force;
+        this.vy = Math.sin(angle) * force;
+        this.life = 1.0;
+        this.decay = Math.random() * 0.03 + 0.01;
+    }
+
+    update(dt) {
+        this.vx *= 0.96;
+        this.vy *= 0.96;
+        this.vy += config.particleGravity * dt;
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.life -= this.decay * dt;
+    }
+
+    draw() {
+        ctx.save();
+        ctx.globalAlpha = this.life;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+}
+
+/**
+ * 敵方子彈類別 - 彈幕系統
+ */
+class EnemyBullet {
+    constructor(x, y, angle, speed) {
+        this.x = x;
+        this.y = y;
+        this.angle = angle;
+        this.speed = speed;
+        this.radius = 5;
+        this.active = true;
+    }
+
+    update(dt) {
+        this.x += Math.cos(this.angle) * this.speed * dt;
+        this.y += Math.sin(this.angle) * this.speed * dt;
+        if (this.x < 0 || this.x > width || this.y < 0 || this.y > height) {
+            this.active = false;
+        }
+    }
+
+    draw() {
+        ctx.save();
+        ctx.fillStyle = '#ff3333';
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#ff0000';
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+}
+
+/**
+ * 道具類別 - 掉落物
+ */
+class Item {
+    constructor(x, y, type) {
+        this.x = x;
+        this.y = y;
+        this.type = type; // 'speed' 或 'damage'
+        this.radius = 12;
+        this.active = true;
+    }
+
+    update() {
+        this.yOffset = Math.sin(Date.now() / 300) * 5;
+    }
+
+    draw() {
+        ctx.save();
+        ctx.fillStyle = this.type === 'speed' ? '#00ffff' : '#ffcc00';
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = ctx.fillStyle;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y + (this.yOffset || 0), this.radius, 0, Math.PI * 2);
+        ctx.fill();
+        // 繪製外框
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+    }
+}
+
+/**
+ * 敵人類別
+ */
+class Enemy {
+    constructor() {
+        this.init();
+    }
+
+    init() {
+        this.x = Math.random() * (width - 100) + 50;
+        this.y = Math.random() * (height * 0.4) + 50;
+        this.radius = 30;
+        this.hp = 100;
+        this.lastFire = 0;
+        this.fireRate = 1500 + Math.random() * 1000;
+        this.rotation = 0;
+    }
+
+    update(dt) {
+        this.rotation += 0.02 * dt;
+        const now = Date.now();
+        // 敵人射擊邏輯
+        if (now - this.lastFire > this.fireRate) {
+            this.shoot();
+            this.lastFire = now;
+        }
+    }
+
+    shoot() {
+        const bulletCount = 10;
+        const step = (Math.PI * 2) / bulletCount;
+        for (let i = 0; i < bulletCount; i++) {
+            const angle = i * step + this.rotation;
+            gameState.enemyBullets.push(new EnemyBullet(this.x, this.y, angle, 4));
+        }
+    }
+
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rotation);
+        // 繪製現代感敵人
+        ctx.strokeStyle = '#e74c3c';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(-20, -20, 40, 40);
+        ctx.strokeRect(-10, -10, 20, 20);
+        // 血條
+        ctx.fillStyle = '#555';
+        ctx.fillRect(-25, -35, 50, 5);
+        ctx.fillStyle = '#e74c3c';
+        ctx.fillRect(-25, -35, 50 * (this.hp / 100), 5);
+        ctx.restore();
+    }
+}
+
+/**
+ * 玩家類別
+ */
+class Player {
+    constructor() {
+        this.x = 0;
+        this.y = 0;
+        this.radius = 20;
+        this.speed = config.basePlayerSpeed;
+        this.powerLevel = 1;
+    }
+
+    update(dt) {
+        if (keys['w'] || keys['arrowup']) this.y -= this.speed * dt;
+        if (keys['s'] || keys['arrowdown']) this.y += this.speed * dt;
+        if (keys['a'] || keys['arrowleft']) this.x -= this.speed * dt;
+        if (keys['d'] || keys['arrowright']) this.x += this.speed * dt;
+
+        // 邊界限制
+        this.x = Math.max(this.radius, Math.min(width - this.radius, this.x));
+        this.y = Math.max(this.radius, Math.min(height - this.radius, this.y));
+    }
+
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        // 核心
+        ctx.fillStyle = '#3498db';
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = '#3498db';
+        ctx.beginPath();
+        ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+        ctx.fill();
+        // 外環
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, this.radius + 5, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+    }
+}
+
+/**
+ * 遊戲管理器
+ */
+const gameState = {
+    player: new Player(),
+    enemies: [],
+    enemyBullets: [],
+    particles: [],
+    items: [],
+    mouse: { x: 0, y: 0, isSniper: false }
+};
+
+function init() {
+    resize();
+    gameState.player.x = width / 2;
+    gameState.player.y = height * 0.8;
+    
+    // 生成初始敵人
+    for(let i=0; i<3; i++) gameState.enemies.push(new Enemy());
+
+    // 事件監聽
+    window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+    window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+    window.addEventListener('mousemove', e => {
+        gameState.mouse.x = e.clientX;
+        gameState.mouse.y = e.clientY;
+    });
+    window.addEventListener('mousedown', e => {
+        if (e.button === 0) shoot();
+        if (e.button === 2) setSniperMode(true);
+    });
+    window.addEventListener('mouseup', e => {
+        if (e.button === 2) setSniperMode(false);
+    });
+    window.addEventListener('contextmenu', e => e.preventDefault());
+
+    requestAnimationFrame(gameLoop);
+}
+
+function setSniperMode(active) {
+    gameState.mouse.isSniper = active;
+    timeScale = active ? config.slowTime : config.normalTime;
+    document.getElementById('mode').innerText = active ? "狙擊模式 (慢動作)" : "一般模式";
+    document.getElementById('mode').style.color = active ? "#ff3333" : "#00ffcc";
+}
+
+function createExplosion(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        gameState.particles.push(new Particle(x, y, color));
+    }
+}
+
+function shoot() {
+    shakeIntensity = 10;
+    
+    // 角色後座力
+    const angle = Math.atan2(gameState.mouse.y - gameState.player.y, gameState.mouse.x - gameState.player.x);
+    gameState.player.x -= Math.cos(angle) * config.recoil;
+    gameState.player.y -= Math.sin(angle) * config.recoil;
+
+    // 擊中判定 (Hitscan)
+    gameState.enemies.forEach((enemy, index) => {
+        const dx = gameState.mouse.x - enemy.x;
+        const dy = gameState.mouse.y - enemy.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+
+        if (dist < enemy.radius + (gameState.player.powerLevel * 5)) {
+            enemy.hp -= config.bulletDamage;
+            createExplosion(gameState.mouse.x, gameState.mouse.y, '#ffffff', 10);
+            
+            if (enemy.hp <= 0) {
+                createExplosion(enemy.x, enemy.y, '#ff6600', 30);
+                score += 100;
+                // 掉落道具
+                if (Math.random() > 0.5) {
+                    gameState.items.push(new Item(enemy.x, enemy.y, Math.random() > 0.5 ? 'speed' : 'damage'));
+                }
+                enemy.init(); // 重生敵人
+            }
+        }
+    });
+
+    // 槍口閃光粒子
+    createExplosion(gameState.player.x, gameState.player.y, '#ffff00', 5);
+}
+
+function checkCollisions() {
+    const p = gameState.player;
+
+    // 1. 玩家與敵方子彈
+    gameState.enemyBullets.forEach((b, i) => {
+        const dx = p.x - b.x;
+        const dy = p.y - b.y;
+        if (Math.sqrt(dx*dx + dy*dy) < p.radius + b.radius) {
+            shakeIntensity = 20;
+            createExplosion(p.x, p.y, '#ff0000', 15);
+            gameState.enemyBullets.splice(i, 1);
+            score = Math.max(0, score - 50);
+        }
+    });
+
+    // 2. 玩家與道具
+    gameState.items.forEach((item, i) => {
+        const dx = p.x - item.x;
+        const dy = p.y - item.y;
+        if (Math.sqrt(dx*dx + dy*dy) < p.radius + item.radius) {
+            if (item.type === 'speed') p.speed += 0.5;
+            else {
+                p.powerLevel++;
+                config.bulletDamage += 10;
+            }
+            gameState.items.splice(i, 1);
+            createExplosion(item.x, item.y, '#ffffff', 15);
+            document.getElementById('power').innerText = p.powerLevel;
+        }
+    });
+}
+
+function gameLoop(timeStamp) {
+    const dt = (timeStamp - lastTime) / 16.66 * timeScale;
+    lastTime = timeStamp;
+
+    update(dt);
+    draw();
+
+    requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+    gameState.player.update(dt);
+    gameState.enemies.forEach(e => e.update(dt));
+    
+    gameState.enemyBullets.forEach(b => b.update(dt));
+    gameState.enemyBullets = gameState.enemyBullets.filter(b => b.active);
+
+    gameState.particles.forEach((p, i) => {
+        p.update(dt);
+        if (p.life <= 0) gameState.particles.splice(i, 1);
+    });
+
+    gameState.items.forEach(item => item.update());
+
+    checkCollisions();
+
+    if (shakeIntensity > 0.1) shakeIntensity *= config.shakeDecay;
+    else shakeIntensity = 0;
+
+    document.getElementById('score').innerText = score;
+}
+
+function draw() {
+    ctx.clearRect(0, 0, width, height);
+
+    ctx.save();
+    // 螢幕震動
+    if (shakeIntensity > 0) {
+        ctx.translate((Math.random()-0.5)*shakeIntensity, (Math.random()-0.5)*shakeIntensity);
+    }
+
+    // 繪製背景裝飾（網格）
+    drawGrid();
+
+    gameState.items.forEach(item => item.draw());
+    gameState.enemies.forEach(e => e.draw());
+    gameState.enemyBullets.forEach(b => b.draw());
+    gameState.player.draw();
+    gameState.particles.forEach(p => p.draw());
+
+    ctx.restore();
+
+    // 狙擊鏡效果 (最後繪製，不受震動影響)
+    if (gameState.mouse.isSniper) {
+        drawSniperScope();
+    }
+}
+
+function drawGrid() {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+    ctx.lineWidth = 1;
+    for(let i=0; i<width; i+=50) {
+        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, height); ctx.stroke();
+    }
+    for(let i=0; i<height; i+=50) {
+        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(width, i); ctx.stroke();
+    }
+}
+
+function drawSniperScope() {
+    const { x, y } = gameState.mouse;
+    const radius = 180;
+
+    ctx.save();
+    // 黑色遮罩
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.beginPath();
+    ctx.rect(0, 0, width, height);
+    ctx.arc(x, y, radius, 0, Math.PI * 2, true);
+    ctx.fill();
+
+    // 狙擊鏡圓框
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // 十字線
+    ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x - radius, y); ctx.lineTo(x + radius, y);
+    ctx.moveTo(x, y - radius); ctx.lineTo(x, y + radius);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+}
+
+window.addEventListener('resize', resize);
+init();
+
+</script>
+</body>
+</html>
